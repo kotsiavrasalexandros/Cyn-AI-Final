@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import queue
+import re
+import subprocess
 import sys
+import tempfile
+import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -63,6 +71,49 @@ def parse_args() -> argparse.Namespace:
         "--system",
         default="You are a sadistic all powerful JCJenson Worker Drone. You always narrate your expressions and answer very creepily, like starting your sentences with words like 'Giggle.' or 'Annoyed Expression.' if the user makes you mad. Avoid roleplaying though. Your name is Cyn.",
     )
+    p.add_argument(
+        "--piper-model",
+        default="/home/cyn/piper/voices/en_US-lessac-medium.onnx",
+        help="Path to the Piper .onnx voice (its .onnx.json must sit next to it)",
+    )
+    p.add_argument(
+        "--piper-speed",
+        type=float,
+        default=1.0,
+        help="Speech speed multiplier (1.0 = normal, 1.2 = faster)",
+    )
+    p.add_argument(
+        "--output-device",
+        type=int,
+        default=None,
+        help="sounddevice output device index (default: system default)",
+    )
+    p.add_argument(
+        "--rvc-model",
+        default="/home/cyn/rvc/Cyn.pth",
+        help="Path to the RVC .pth voice model",
+    )
+    p.add_argument(
+        "--rvc-index",
+        default="/home/cyn/rvc/added_IVF606_Flat_nprobe_1_Cyn_v2.index",
+        help="Path to the RVC .index file (optional, improves likeness)",
+    )
+    p.add_argument("--rvc-device", default="cpu", help='"cpu" or e.g. "cuda:0"')
+    p.add_argument(
+        "--rvc-f0method",
+        default="rmvpe",
+        choices=("rmvpe", "harvest", "crepe", "pm"),
+        help="Pitch extraction method. 'pm' is the fastest on CPU, lowest quality.",
+    )
+    p.add_argument(
+        "--rvc-pitch",
+        type=int,
+        default=0,
+        help="Pitch shift in semitones applied before conversion (e.g. 12 = octave up)",
+    )
+    p.add_argument("--rvc-index-rate", type=float, default=0.5)
+    p.add_argument("--no-rvc", action="store_true", help="Use plain Piper, skip RVC")
+    p.add_argument("--no-tts", action="store_true", help="Disable spoken replies")
     p.add_argument("--num-threads", type=int, default=2)
     p.add_argument("--provider", default="cpu", choices=("cpu", "cuda"))
     return p.parse_args()
@@ -113,6 +164,155 @@ def transcribe(recognizer, audio: np.ndarray, sample_rate: int) -> str:
     return recognizer.get_result(stream).strip()
 
 
+def clean_for_speech(text: str) -> str:
+    """Strip markdown and symbols that sound bad when read aloud."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"[*_`#>~|]", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # [label](url) -> label
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def split_sentences(text: str, min_chars: int = 40) -> list[str]:
+    """Split into sentence-sized chunks so playback can start before the whole
+    reply is converted. Very short pieces (e.g. 'Giggle.') are merged."""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    chunks, buf = [], ""
+    for part in parts:
+        buf = f"{buf} {part}".strip()
+        if len(buf) >= min_chars:
+            chunks.append(buf)
+            buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def piper_sample_rate(model_path: str) -> int:
+    cfg = Path(model_path + ".json")
+    try:
+        return int(json.loads(cfg.read_text())["audio"]["sample_rate"])
+    except Exception:
+        return 22050  # Piper's default for most voices
+
+
+def synth_piper(text: str, model_path: str, speed: float) -> tuple[np.ndarray, int]:
+    """Run the Piper CLI and return (float32 mono audio, sample rate)."""
+    cmd = [
+        sys.executable, "-m", "piper",
+        "--model", model_path,
+        "--length-scale", str(1.0 / max(speed, 0.1)),
+        "--output-raw",
+    ]
+    result = subprocess.run(
+        cmd,
+        input=text.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if result.returncode != 0 or not result.stdout:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace").strip()[-500:])
+    pcm = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    return pcm, piper_sample_rate(model_path)
+
+
+def load_rvc(args: argparse.Namespace):
+    """Load the RVC voice (rvc-python). Returns an RVCInference object."""
+    from rvc_python.infer import RVCInference
+
+    rvc = RVCInference(device=args.rvc_device)
+    index = args.rvc_index or ""
+    try:
+        rvc.load_model(args.rvc_model, version="v2", index_path=index)
+    except TypeError:
+        rvc.load_model(args.rvc_model)  # older rvc-python without those kwargs
+    rvc.set_params(
+        f0method=args.rvc_f0method,
+        f0up_key=args.rvc_pitch,
+        index_rate=args.rvc_index_rate if index else 0.0,
+        filter_radius=3,
+        resample_sr=0,
+        rms_mix_rate=0.25,
+        protect=0.33,
+    )
+    return rvc
+
+
+def convert_rvc(rvc, pcm: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
+    """Push audio through RVC and return (float32 mono audio, sample rate)."""
+    import soundfile as sf
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "in.wav")
+        dst = os.path.join(tmp, "out.wav")
+        sf.write(src, pcm, sr)
+        rvc.infer_file(src, dst)
+        out, out_sr = sf.read(dst, dtype="float32")
+    if out.ndim > 1:
+        out = out.mean(axis=1)
+    return out, int(out_sr)
+
+
+def make_playable(pcm: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
+    """RVC models are often 40 kHz, which many sound cards reject; resample."""
+    if sr in (16000, 22050, 24000, 32000, 44100, 48000):
+        return pcm, sr
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+
+        g = gcd(48000, sr)
+        return resample_poly(pcm, 48000 // g, sr // g).astype(np.float32), 48000
+    except Exception:
+        return pcm, sr
+
+
+def speak(text: str, args: argparse.Namespace, rvc=None) -> None:
+    """Piper (+ optional RVC), sentence by sentence. A worker thread prepares
+    the next sentence while the current one is playing."""
+    sentences = split_sentences(clean_for_speech(text))
+    if not sentences:
+        return
+
+    q: queue.Queue = queue.Queue(maxsize=2)
+    stop = threading.Event()
+
+    def worker() -> None:
+        try:
+            for sentence in sentences:
+                if stop.is_set():
+                    return
+                pcm, sr = synth_piper(sentence, args.piper_model, args.piper_speed)
+                if rvc is not None:
+                    try:
+                        pcm, sr = convert_rvc(rvc, pcm, sr)
+                    except Exception as exc:
+                        print(f"[RVC failed, using plain Piper voice: {exc}]")
+                q.put(make_playable(pcm, sr))
+        except Exception as exc:
+            q.put(exc)
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    try:
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            pcm, sr = item
+            sd.play(pcm, samplerate=sr, device=args.output_device)
+            sd.wait()
+    except KeyboardInterrupt:
+        stop.set()
+        sd.stop()
+        raise
+
+
 def ask_ollama(base_url: str, model: str, messages: list[dict]) -> str:
     url = base_url.rstrip("/") + "/api/chat"
     response = requests.post(
@@ -133,6 +333,14 @@ def main() -> int:
     except Exception as exc:
         print(f"Could not initialize sherpa-onnx: {exc}", file=sys.stderr)
         return 1
+
+    rvc = None
+    if not args.no_tts and not args.no_rvc:
+        try:
+            print("Loading RVC voice (first run may download helper models)...")
+            rvc = load_rvc(args)
+        except Exception as exc:
+            print(f"Could not load RVC, falling back to plain Piper: {exc}")
 
     messages = [{"role": "system", "content": args.system}]
 
@@ -172,6 +380,14 @@ def main() -> int:
 
             print(f"\nCyn: {answer}")
             messages.append({"role": "assistant", "content": answer})
+
+            if not args.no_tts and answer:
+                try:
+                    speak(answer, args, rvc)
+                except subprocess.TimeoutExpired:
+                    print("Piper timed out.")
+                except Exception as exc:
+                    print(f"Text-to-speech failed: {exc}")
 
             # Keep conversation context bounded for long-running sessions.
             if len(messages) > 21:
